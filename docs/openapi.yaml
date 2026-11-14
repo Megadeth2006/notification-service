@@ -1,0 +1,743 @@
+openapi: 3.1.0
+info:
+  title: Notification Service API
+  version: 0.1.0-draft
+servers:
+  - url: http://localhost:8000/api/v1
+security:
+  - StoreApiKey: []
+tags:
+  - name: Stores
+    description: Данные текущего магазина
+  - name: Notifications
+    description: Создание уведомлений и наблюдение за доставкой
+  - name: Billing
+    description: Баланс и история операций
+  - name: Admin
+    description: Регистрация и тестовый баланс
+  - name: System
+
+paths:
+  /admin/stores:
+    post:
+      tags: [Admin]
+      operationId: createStore
+      summary: Зарегистрировать магазин и выдать API-ключ
+      description: |
+        Начальный баланс — 0. Ключ выдаётся один раз, хранится как хеш.
+        Повтор запроса создаёт новый магазин.
+      security:
+        - AdminApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  minLength: 1
+                  maxLength: 100
+            example:
+              name: Demo Shop
+      responses:
+        '201':
+          description: Магазин создан; сохраните выданный ключ
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [store, api_key]
+                properties:
+                  store:
+                    $ref: '#/components/schemas/Store'
+                  api_key:
+                    type: string
+                    description: Секретный ключ магазина; не включать в логи
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /stores/me:
+    get:
+      tags: [Stores]
+      operationId: getCurrentStore
+      summary: Получить текущий магазин
+      responses:
+        '200':
+          description: Данные магазина
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Store'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /notifications:
+    post:
+      tags: [Notifications]
+      operationId: createNotification
+      summary: Принять уведомление к отправке и зарезервировать средства
+      description: |
+        202: уведомление (queued), резерв, ключ идемпотентности и outbox-задание
+        записаны одной транзакцией PostgreSQL; при ошибке откатывается всё.
+        Недоступность RabbitMQ не мешает приёму: задание остаётся в outbox.
+        Повтор с тем же ключом и телом возвращает 200 и текущее уведомление
+        без нового резерва и задания; другое тело — 409. Конкурентные повторы
+        создают одно уведомление. Ключ проверяется до баланса; 402/422 его не занимают.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotificationCreate'
+            examples:
+              email:
+                value:
+                  channel: email
+                  recipient: customer@example.com
+                  subject: Заказ принят
+                  body: Ваш заказ №123 принят в обработку.
+              sms:
+                value:
+                  channel: sms
+                  recipient: '+79990000000'
+                  body: Заказ №123 доставлен.
+              push:
+                value:
+                  channel: push
+                  recipient: demo-device-token
+                  title: Статус заказа
+                  body: Заказ №123 передан курьеру.
+      responses:
+        '202':
+          description: Уведомление, резерв, ключ и outbox-задание сохранены
+          headers:
+            Location:
+              description: URL вида /api/v1/notifications/{notification_id}
+              schema:
+                type: string
+                format: uri-reference
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Notification'
+        '200':
+          description: Повтор по Idempotency-Key; текущее состояние существующего уведомления
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Notification'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          description: Недостаточно доступных средств; code = insufficient_funds
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: insufficient_funds
+                message: Недостаточно доступных средств для резервирования.
+                details:
+                  available_minor: 50
+                  required_minor: 100
+                  currency: RUB
+        '409':
+          $ref: '#/components/responses/IdempotencyConflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    get:
+      tags: [Notifications]
+      operationId: listNotifications
+      summary: Получить уведомления текущего магазина
+      description: Сортировка по created_at DESC, id DESC. Offset-пагинация не является снимком данных.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/NotificationStatus'
+        - name: channel
+          in: query
+          schema:
+            $ref: '#/components/schemas/Channel'
+      responses:
+        '200':
+          description: Страница уведомлений
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, limit, offset, total]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Notification'
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
+                  total:
+                    type: integer
+                    minimum: 0
+                    description: Количество уведомлений с учётом фильтров
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /notifications/{notification_id}:
+    parameters:
+      - $ref: '#/components/parameters/NotificationId'
+    get:
+      tags: [Notifications]
+      operationId: getNotification
+      summary: Получить уведомление и его текущий статус
+      responses:
+        '200':
+          description: Уведомление
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Notification'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /notifications/{notification_id}/attempts:
+    parameters:
+      - $ref: '#/components/parameters/NotificationId'
+    get:
+      tags: [Notifications]
+      operationId: listDeliveryAttempts
+      summary: Получить попытки доставки
+      description: |
+        По attempt_number ASC, не более 3 записей. Попытка записывается до вызова;
+        сбой между записью и вызовом тоже расходует попытку. Прерванная попытка — unknown.
+      responses:
+        '200':
+          description: Попытки, включая незавершённую
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    maxItems: 3
+                    items:
+                      $ref: '#/components/schemas/DeliveryAttempt'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /billing/balance:
+    get:
+      tags: [Billing]
+      operationId: getBalance
+      summary: Получить доступные и зарезервированные средства
+      responses:
+        '200':
+          description: Текущий баланс
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Balance'
+              example:
+                currency: RUB
+                available_minor: 9900
+                reserved_minor: 100
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /billing/transactions:
+    get:
+      tags: [Billing]
+      operationId: listTransactions
+      summary: Получить историю пополнений, резервов, списаний и возвратов резервов
+      description: Сортировка по created_at DESC, id DESC. Все записи относятся к текущему магазину.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+        - name: notification_id
+          in: query
+          description: Фильтр по уведомлению; для чужого или отсутствующего ID список пуст
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Страница операций
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, limit, offset, total]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Transaction'
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
+                  total:
+                    type: integer
+                    minimum: 0
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/stores/{store_id}/top-ups:
+    parameters:
+      - name: store_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [Admin]
+      operationId: createTestTopUp
+      summary: Пополнить тестовый баланс магазина
+      description: |
+        Тестовое пополнение без платёжного шлюза. Баланс, транзакция и ключ
+        сохраняются атомарно. Повтор с той же суммой — 200, с другой — 409.
+        Область ключа — магазин назначения и операция пополнения.
+      security:
+        - AdminApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [amount_minor]
+              properties:
+                amount_minor:
+                  type: integer
+                  format: int64
+                  minimum: 1
+                  maximum: 100000000
+            example:
+              amount_minor: 10000
+      responses:
+        '201':
+          description: Баланс пополнен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        '200':
+          description: Повтор по Idempotency-Key; исходная транзакция
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/IdempotencyConflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /health:
+    get:
+      tags: [System]
+      operationId: getHealth
+      summary: Проверить, что HTTP-процесс работает
+      description: Liveness; не проверяет PostgreSQL, RabbitMQ и наличие работающего воркера.
+      security: []
+      responses:
+        '200':
+          description: HTTP-процесс отвечает
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: ok
+
+components:
+  securitySchemes:
+    StoreApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: Ключ магазина, выданный администратором
+    AdminApiKey:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+      description: Отдельный секрет администратора из конфигурации сервиса
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Ключ уникален для магазина и операции.
+        При сетевом повторе используйте исходный ключ. Ключи успешных операций
+        хранятся весь срок жизни данных MVP. Сравниваем JSON валидированных полей:
+        UTF-8, ключи отсортированы, разделители без пробелов, Unicode без экранирования.
+        Порядок полей не важен. Значения строк сохраняются точно: без обрезки пробелов,
+        смены регистра и Unicode-нормализации, включая получателя, текст и push-токен.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: '^[A-Za-z0-9._:-]+$'
+      example: order-123-confirmation-email
+    NotificationId:
+      name: notification_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    Offset:
+      name: offset
+      in: query
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+
+  schemas:
+    Channel:
+      type: string
+      enum: [email, sms, push]
+
+    NotificationStatus:
+      type: string
+      enum: [queued, processing, retrying, delivered, failed]
+      description: |
+        queued — ожидание; processing — отправка; retrying — ожидание повтора;
+        delivered — тестовый провайдер подтвердил доставку; failed — окончательная ошибка.
+        Переходы: queued/retrying -> processing -> delivered/failed/retrying.
+        delivered и failed терминальны. Общего срока ожидания в MVP нет:
+        при недоступности провайдеров или Redis резерв сохраняется до восстановления.
+
+    NotificationCreate:
+      oneOf:
+        - $ref: '#/components/schemas/EmailNotificationCreate'
+        - $ref: '#/components/schemas/SmsNotificationCreate'
+        - $ref: '#/components/schemas/PushNotificationCreate'
+      discriminator:
+        propertyName: channel
+        mapping:
+          email: '#/components/schemas/EmailNotificationCreate'
+          sms: '#/components/schemas/SmsNotificationCreate'
+          push: '#/components/schemas/PushNotificationCreate'
+
+    EmailNotificationCreate:
+      type: object
+      additionalProperties: false
+      required: [channel, recipient, subject, body]
+      properties:
+        channel:
+          type: string
+          const: email
+        recipient:
+          type: string
+          format: email
+          maxLength: 254
+        subject:
+          type: string
+          minLength: 1
+          maxLength: 200
+        body:
+          type: string
+          minLength: 1
+          maxLength: 10000
+          description: Обычный текст; HTML и вложения вне MVP
+
+    SmsNotificationCreate:
+      type: object
+      additionalProperties: false
+      required: [channel, recipient, body]
+      properties:
+        channel:
+          type: string
+          const: sms
+        recipient:
+          type: string
+          pattern: '^\+[1-9][0-9]{1,14}$'
+          description: Номер в международном формате E.164
+        body:
+          type: string
+          minLength: 1
+          maxLength: 160
+          description: Для тестового провайдера одна фиксированная цена, без расчёта SMS-сегментов
+
+    PushNotificationCreate:
+      type: object
+      additionalProperties: false
+      required: [channel, recipient, title, body]
+      properties:
+        channel:
+          type: string
+          const: push
+        recipient:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: Токен устройства тестового push-провайдера
+        title:
+          type: string
+          minLength: 1
+          maxLength: 100
+        body:
+          type: string
+          minLength: 1
+          maxLength: 1000
+
+    Notification:
+      type: object
+      required: [id, message, status, billing, attempt_count, max_attempts, created_at, updated_at, next_retry_at, completed_at, failure_code]
+      properties:
+        id:
+          type: string
+          format: uuid
+        message:
+          $ref: '#/components/schemas/NotificationCreate'
+        status:
+          $ref: '#/components/schemas/NotificationStatus'
+        billing:
+          type: object
+          required: [amount_minor, currency, state]
+          description: |
+            Цена фиксирована при создании. queued/processing/retrying — reserved,
+            delivered — captured, failed — released. Статус и операция с резервом атомарны.
+          properties:
+            amount_minor:
+              type: integer
+              format: int64
+              minimum: 1
+            currency:
+              type: string
+              const: RUB
+            state:
+              type: string
+              enum: [reserved, captured, released]
+        attempt_count:
+          type: integer
+          minimum: 0
+          maximum: 3
+          description: Количество записанных попыток, включая текущую и прерванные сбоем
+        max_attempts:
+          type: integer
+          const: 3
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        next_retry_at:
+          type: [string, 'null']
+          format: date-time
+          description: Время следующей проверки для retrying, иначе null; доступность провайдера не гарантируется
+        completed_at:
+          type: [string, 'null']
+          format: date-time
+          description: Заполнено для delivered и failed, иначе null
+        failure_code:
+          type: [string, 'null']
+          enum: [invalid_recipient, retries_exhausted, delivery_failed, null]
+          description: |
+            Для failed: invalid_recipient — ошибка получателя; delivery_failed — другая
+            постоянная ошибка; retries_exhausted — третья временная ошибка или unknown.
+            Постоянная ошибка имеет приоритет над исчерпанием попыток. Иначе null.
+
+    DeliveryAttempt:
+      type: object
+      required: [id, attempt_number, provider, status, started_at, finished_at, error_code, provider_message_id]
+      properties:
+        id:
+          type: string
+          format: uuid
+        attempt_number:
+          type: integer
+          minimum: 1
+          maximum: 3
+        provider:
+          type: string
+          description: Имя тестового провайдера
+          examples: [mock-email-primary]
+        status:
+          type: string
+          enum: [started, succeeded, temporary_failure, permanent_failure, unknown]
+          description: |
+            permanent_failure завершает отправку. temporary_failure и unknown допускают
+            повтор, после третьей попытки — failed. unknown означает неизвестный результат.
+            Задержки 5 и 30 секунд считаются от finished_at первой и второй попыток.
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: [string, 'null']
+          format: date-time
+          description: null только для started
+        error_code:
+          type: [string, 'null']
+          description: Нормализованный код ошибки; null для started и succeeded
+          examples: [provider_unavailable, provider_rate_limited, invalid_recipient, timeout]
+        provider_message_id:
+          type: [string, 'null']
+
+    Store:
+      type: object
+      required: [id, name, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    Balance:
+      type: object
+      required: [currency, available_minor, reserved_minor]
+      description: Остаток средств магазина равен available_minor + reserved_minor; списанное в него не входит
+      properties:
+        currency:
+          type: string
+          const: RUB
+        available_minor:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Средства, доступные для новых уведомлений
+        reserved_minor:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Средства, зарезервированные под незавершённые уведомления
+
+    Transaction:
+      type: object
+      required: [id, type, amount_minor, currency, notification_id, created_at]
+      description: |
+        top_up: +available; reserve: available -> reserved;
+        capture: -reserved; release: reserved -> available. Записи неизменяемы.
+        На уведомление — один reserve и один capture либо release при завершении.
+        Их суммы равны сохранённой цене уведомления; повтор задачи не создаёт операций.
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [top_up, reserve, capture, release]
+        amount_minor:
+          type: integer
+          format: int64
+          minimum: 1
+        currency:
+          type: string
+          const: RUB
+        notification_id:
+          type: [string, 'null']
+          format: uuid
+          description: null для top_up, иначе ID уведомления
+        created_at:
+          type: string
+          format: date-time
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Стабильный машинный код, используемый клиентом
+          examples: [validation_error, unauthorized, not_found, insufficient_funds, idempotency_conflict, service_unavailable]
+        message:
+          type: string
+          description: Человекочитаемое описание
+        details:
+          type: object
+          additionalProperties: true
+          description: Контекст ошибки, для валидации — массив errors с полями location и message
+
+  responses:
+    Unauthorized:
+      description: Отсутствует или неверен ключ требуемого типа; code = unauthorized
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Ресурс отсутствует или недоступен этому магазину; code = not_found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ValidationError:
+      description: Некорректное тело, JSON, параметры или обязательный заголовок; code = validation_error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: validation_error
+            message: Ошибка валидации запроса.
+            details:
+              errors:
+                - location: [body, recipient]
+                  message: Некорректный адрес получателя.
+    IdempotencyConflict:
+      description: Ключ уже использован с другим телом запроса; code = idempotency_conflict
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unavailable:
+      description: Не удалось подтвердить результат операции; повторите запрос с исходным Idempotency-Key
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
