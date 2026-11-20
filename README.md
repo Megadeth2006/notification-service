@@ -4,11 +4,13 @@
 
 ## Быстрый старт
 
-Требуется Python 3.12+ и [uv](https://docs.astral.sh/uv/).
+Требуется Python 3.12+ и [uv](https://docs.astral.sh/uv/) и Docker.
 
 ```bash
+cp .env.example .env
 uv sync
 uv run pre-commit install
+docker compose up -d    # PostgreSQL и RabbitMQ
 uv run uvicorn app.main:app --reload
 ```
 
