@@ -1,75 +1,18 @@
 import asyncio
-import os
-from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from hashlib import sha256
 from typing import Any
-from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select, text, update
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.pool import NullPool
+from sqlalchemy import func, select, update
 
-from app.db.base import Base
 from app.db.models.notification import Notification
-from app.db.models.shop import Shop
 from app.db.session import get_session
 from app.main import app
 from app.notifications.statuses import NotificationStatus
 
 HEADERS = {"X-API-Key": "shop-one", "Idempotency-Key": "order-123"}
 SMS: dict[str, Any] = {"channel": "sms", "recipient": "+79990000000", "body": "Заказ принят"}
-
-
-@pytest.fixture
-def client() -> Iterator[TestClient]:
-    url = os.environ.get("TEST_DATABASE_URL")
-    if not url:
-        pytest.skip("Set TEST_DATABASE_URL to run PostgreSQL integration tests")
-    schema = f"test_notifications_{uuid4().hex}"
-    engine = create_async_engine(
-        url,
-        poolclass=NullPool,
-        connect_args={"server_settings": {"search_path": schema}},
-    )
-
-    async def setup() -> None:
-        async with engine.begin() as connection:
-            await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
-            await connection.run_sync(Base.metadata.create_all)
-        async with AsyncSession(engine) as session:
-            session.add_all(
-                [
-                    Shop(name="One", api_key_hash=sha256(b"shop-one").hexdigest()),
-                    Shop(name="Two", api_key_hash=sha256(b"shop-two").hexdigest()),
-                    Shop(
-                        name="Inactive",
-                        api_key_hash=sha256(b"inactive").hexdigest(),
-                        is_active=False,
-                    ),
-                ]
-            )
-            await session.commit()
-
-    async def override_session() -> AsyncIterator[AsyncSession]:
-        async with AsyncSession(engine, expire_on_commit=False) as session:
-            yield session
-
-    async def teardown() -> None:
-        async with engine.begin() as connection:
-            await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
-        await engine.dispose()
-
-    asyncio.run(setup())
-    app.dependency_overrides[get_session] = override_session
-    try:
-        with TestClient(app) as test_client:
-            yield test_client
-    finally:
-        app.dependency_overrides.pop(get_session, None)
-        asyncio.run(teardown())
 
 
 @pytest.mark.parametrize(
