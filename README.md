@@ -20,9 +20,10 @@ uv run uvicorn app.main:app --reload
 
 ## Уведомления
 
-`POST /notifications` принимает сообщение, сохраняет его в PostgreSQL и возвращает
-`202 Accepted`, ID и статус `created`. `GET /notifications/{id}` возвращает текущее
-состояние. Публикация в RabbitMQ и переход в `queued` добавляются в задаче #6.
+`POST /notifications` принимает сообщение, сохраняет уведомление и outbox-задание
+одной транзакцией PostgreSQL и возвращает `202 Accepted`, ID и статус `created`.
+`GET /notifications/{id}` возвращает текущее состояние. При недоступности RabbitMQ
+API продолжает принимать сообщения; задания остаются в outbox до публикации.
 
 Оба метода требуют `X-API-Key` активного магазина. Ключ сверяется по SHA-256 с
 `shops.api_key_hash`. Регистрация магазинов реализуется отдельно в задаче #8.
@@ -62,6 +63,64 @@ Push-заголовок хранится в `notifications.subject`, текст 
 
 ```bash
 TEST_DATABASE_URL=postgresql+asyncpg://USER:PASSWORD@localhost:5432/TEST_DB uv run pytest
+```
+
+## Очереди и воркер
+
+После запуска PostgreSQL и RabbitMQ примените миграции и запустите процессы
+в отдельных терминалах из корня проекта:
+
+```bash
+uv run alembic upgrade head
+uv run uvicorn app.main:app --reload
+uv run python -m app.messaging.relay
+uv run python -m app.worker email
+uv run python -m app.worker sms
+uv run python -m app.worker push
+```
+
+Топология объявляется автоматически: durable direct exchange `notifications` и
+три durable очереди `notifications.email`, `notifications.sms`, `notifications.push`.
+Routing key соответствует каналу. Формат задания:
+
+```json
+{"notification_id": 123, "channel": "sms"}
+```
+
+Relay выбирает неопубликованное событие через `FOR UPDATE SKIP LOCKED`, переводит
+уведомление из `created` в `queued` и отправляет persistent-сообщение с
+`mandatory=True` и publisher confirms. После подтверждения коммитит статус и
+`published_at`. При ошибке публикации транзакция откатывается; следующая попытка
+выполняется через секунду. Пустой outbox также проверяется раз в секунду.
+Можно запускать несколько relay: заблокированные события пропускаются.
+
+Воркер получает по одному сообщению без автоматического ack. Переход из
+`created`/`queued` в `sending` выполняется условным UPDATE, затем коммитится,
+и только после этого отправляется ack. Переход из `created` допустим, если
+публикация дошла до RabbitMQ, а коммит relay не подтвердился. Повторные задачи
+для `sending`, `delivered`, `failed` подтверждаются без повторной обработки.
+Повторная публикация outbox не откатывает `sending` обратно в `queued`.
+
+Если БД недоступна, воркер ждёт секунду и возвращает задачу в очередь через nack.
+Невалидный JSON и задания с неправильным каналом отклоняются без возврата в очередь.
+Задания для отсутствующих уведомлений или несовпадающего канала в БД подтверждаются
+без изменения данных. DLQ, отложенные бизнес-retry, провайдеры и восстановление
+незавершённой отправки относятся к следующим задачам. Сейчас каркас завершает
+обработку на статусе `sending` и не выполняет доставку.
+
+Транспорт использует `aio-pika.connect_robust` для восстановления соединений.
+При первоначальном запуске PostgreSQL и RabbitMQ должны быть доступны.
+Потеря подтверждения или сбой до коммита допускают дубли сообщений; защита от них
+находится в БД, гарантии exactly-once для внешней доставки пока нет.
+
+RabbitMQ-тестам нужен отдельный тестовый брокер или vhost: они очищают три очереди
+перед и после сценария. Не указывайте рабочий брокер в `TEST_RABBITMQ_URL`.
+Без этой переменной тесты RabbitMQ пропускаются; в CI брокер поднимается автоматически.
+
+```bash
+TEST_DATABASE_URL=postgresql+asyncpg://USER:PASSWORD@localhost:5432/TEST_DB \
+TEST_RABBITMQ_URL=amqp://USER:PASSWORD@localhost:5672/TEST_VHOST \
+uv run pytest
 ```
 
 ## Настройки

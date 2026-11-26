@@ -8,6 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.enums import Channel
 from app.db.models.notification import Notification
+from app.db.models.outbox_event import OutboxEvent
+from app.messaging.tasks import NotificationTask
 from app.notifications.schemas import (
     EmailMessage,
     NotificationCreate,
@@ -85,6 +87,14 @@ async def create_notification(
     )
     notification = (await session.scalars(statement)).one_or_none()
     created = notification is not None
+    if notification is not None:
+        task = NotificationTask(notification_id=notification.id, channel=notification.channel)
+        session.add(
+            OutboxEvent(
+                notification_id=notification.id,
+                payload=task.model_dump(mode="json"),
+            )
+        )
     if notification is None:
         notification = (
             await session.scalars(
