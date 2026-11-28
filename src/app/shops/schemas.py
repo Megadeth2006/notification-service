@@ -1,7 +1,8 @@
 from datetime import datetime
+from decimal import Decimal
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, StringConstraints, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 ShopName = Annotated[
     str,
@@ -29,3 +30,16 @@ class ShopCreatedResponse(BaseModel):
     api_key: str
     is_active: bool
     created_at: datetime
+
+
+class ShopBalanceTopUp(BaseModel):
+    amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2, allow_inf_nan=False)
+
+
+class ShopMeResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    balance: Decimal
+    reserved_balance: Decimal

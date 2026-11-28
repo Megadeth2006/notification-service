@@ -1,10 +1,13 @@
 import secrets
 from hashlib import sha256
 
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.enums import TransactionType
 from app.db.models.shop import Shop
-from app.shops.schemas import ShopCreate, ShopCreatedResponse
+from app.db.models.transaction import Transaction
+from app.shops.schemas import ShopBalanceTopUp, ShopCreate, ShopCreatedResponse, ShopMeResponse
 
 
 def generate_api_key() -> tuple[str, str]:
@@ -29,3 +32,30 @@ async def create_shop(
         is_active=shop.is_active,
         created_at=shop.created_at,
     )
+
+
+async def top_up_balance(
+    session: AsyncSession,
+    shop_id: int,
+    payload: ShopBalanceTopUp,
+) -> ShopMeResponse:
+    stmt = (
+        update(Shop)
+        .where(Shop.id == shop_id)
+        .values(balance=Shop.balance + payload.amount)
+        .returning(Shop)
+        .execution_options(populate_existing=True)
+    )
+    updated_shop: Shop | None = await session.scalar(stmt)
+    if updated_shop is None:
+        raise ValueError(f"Shop {shop_id} not found")
+
+    tx = Transaction(
+        shop_id=shop_id,
+        type=TransactionType.DEPOSIT,
+        amount=payload.amount,
+        balance_after=updated_shop.balance,
+    )
+    session.add(tx)
+    await session.commit()
+    return ShopMeResponse.model_validate(updated_shop)
